@@ -21,6 +21,7 @@ Prebuilt MCP Server
 import os
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI
@@ -31,7 +32,8 @@ from fastmcp import FastMCP
 from src.health import LivenessResponse, ReadinessResponse, run_checks
 from src.routers.my_agent import router as my_agent_router
 from src.routers.admin import router as admin_router
-from src.utils.config_loader import get_env, get_env_int, load_root_env
+from src.routers.cookbook import router as cookbook_router
+from src.utils.config_loader import get_env, get_env_int, load_agent_env, load_root_env
 from src.utils.logger import get_logger
 
 # =============================================================================
@@ -70,6 +72,44 @@ def register_cleanup(fn: Callable[[], Awaitable[None]]) -> None:
 async def lifespan(app: FastAPI):
     logger.info("=== Prebuilt MCP Server Starting ===")
     async with mcp_app.lifespan(app):
+        # cookbook MCP: 모든 @mcp.tool 등록 완료 후 자율호출 3-Layer 와이어링
+        # (설계서 §7: L1 카탈로그 / L2 referral / L3 chain_with)
+        import asyncio as _asyncio
+
+        from src.agents.cookbook_agent import build_search_description
+        from src.modules.cookbook import service as cookbook_service
+        from src.modules.cookbook.referral import annotate_tools
+
+        # cookbook 전용 env 로드 (COOKBOOK_CONTENT_DIR / TOKENIZER / WATCH_MODE)
+        load_agent_env("cookbook")
+        content_root = Path(__file__).parent / get_env("COOKBOOK_CONTENT_DIR", "cookbook")
+        await cookbook_service.init(mcp, content_root=content_root)
+
+        async def _apply_l1_l2_async() -> None:
+            # L1: cookbook_search.description 끝에 카탈로그 동적 주입
+            tool = await mcp.get_tool("cookbook_search")
+            tool.description = build_search_description()
+            # L2: 동료 도구 description 끝에 D/O/M referral 부착
+            await annotate_tools(mcp, cookbook_service.recipes_by_tool())
+
+        await _apply_l1_l2_async()
+
+        # reload 콜백은 동기 컨텍스트에서 호출되므로 새 이벤트 루프로 감싼다.
+        def _apply_l1_l2_sync() -> None:
+            try:
+                _asyncio.run(_apply_l1_l2_async())
+            except RuntimeError:
+                loop = _asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_apply_l1_l2_async())
+                finally:
+                    loop.close()
+
+        cookbook_service.register_on_reload(_apply_l1_l2_sync)
+
+        # 종료 시 watcher 정리
+        register_cleanup(cookbook_service.cleanup)
+
         yield
     for fn in _cleanup_fns:
         await fn()
@@ -106,6 +146,7 @@ app = FastAPI(
 app.mount("/mcp", mcp_app)
 app.include_router(my_agent_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
+app.include_router(cookbook_router, prefix="/api")
 
 _FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 if os.path.isdir(_FRONTEND_DIST):
@@ -178,6 +219,34 @@ from src.agents.my_agent import my_agent, MY_AGENT_DESCRIPTION
 async def my_agent_tool(input: str) -> str:
     result = await my_agent(input=input, mode="default")
     return result["result"]
+
+
+# -----------------------------------------------------------------------------
+# Cookbook (설계서 doc/cookbook-design.md)
+# REST API: /api/cookbook/* (src/routers/cookbook.py)
+# Layer 1 카탈로그는 lifespan startup hook 에서 동적으로 주입됨.
+# -----------------------------------------------------------------------------
+from src.agents.cookbook_agent import (
+    COOKBOOK_GET_DESCRIPTION,
+    COOKBOOK_SEARCH_DESCRIPTION_STATIC,
+    cookbook_get_agent,
+    cookbook_search_agent,
+)
+
+
+@mcp.tool(name="cookbook_search", description=COOKBOOK_SEARCH_DESCRIPTION_STATIC)
+async def cookbook_search_tool(
+    query: str,
+    kind: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    top_k: int = 5,
+) -> list[dict]:
+    return await cookbook_search_agent(query=query, kind=kind, tags=tags, top_k=top_k)
+
+
+@mcp.tool(name="cookbook_get", description=COOKBOOK_GET_DESCRIPTION)
+async def cookbook_get_tool(id: str) -> dict:
+    return await cookbook_get_agent(id=id)
 
 
 # =============================================================================
