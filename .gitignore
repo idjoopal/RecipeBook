@@ -1,0 +1,60 @@
+# Environment files
+.env
+**/.env
+*.env.local
+# Tool-specific env files (예: nl2sql.env, othertool.env)
+**/*.env
+# 예외: .example 파일은 커밋에 포함 (템플릿 파일)
+!*.env.example
+!**/*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# 런타임 데이터 (생성된 PPT 템플릿·세션·백업) — 소스 아님
+data/
+
+# Chart_Generator 런타임 산출물 (생성된 차트 HTML/PNG·캐시)
+_charts_output/
+src/_charts_output/
+.chart_generator_cache/
+
+# Jupyter 체크포인트 (stale 백업)
+.ipynb_checkpoints/
+
+# 런타임 산출물 (서버 로그/PID, SQL Explorer SQLite, DART 디버그) — 소스 아님
+server.log
+server.pid
+.sql_explorer/
+src/modules/dart_search/result/
+

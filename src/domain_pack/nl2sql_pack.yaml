@@ -1,0 +1,95 @@
+# NL2SQL 정적 지식 (도메인 팩 + 정적 프롬프트 통합)
+# - SQL_GENERATE_PROMPT 등에 주입되는 도메인/방언 정적값 + 정적 프롬프트 섹션을 한 파일에 모은다.
+# - 과거에는 정적 프롬프트(sql_style_guide 등)를 config/prompt_static.yaml에 분리했으나 이 파일로 통합.
+# - 운영 시점에 변경되는 값(데이터 기준일·당월 OL·계획 버전 등)도 여기서 직접 수정한다(아래 data_range/current_plan).
+# - service.py 의 _load_domain_pack / _load_static_prompt_sections 가 이 파일을 함께 읽는다.
+
+# SQL Dialect — DB 종류에 맞춰 수정 (예: "PostgreSQL", "MariaDB")
+sql_dialect: "PostgreSQL"
+
+sql_style_guide: |
+  ## Code Style
+  - Use UPPERCASE for SQL keywords (SELECT, FROM, WHERE, GROUP BY, etc.)
+  - Keep table and column names in lowercase as-is.
+  - Always use AS to assign meaningful aliases to aggregated columns.
+  - Use NULLIF(divisor, 0) to prevent division by zero.
+  - Use COALESCE(column, 0) when aggregating monetary/numeric columns (e.g., SUM(COALESCE(sales_amt, 0))).
+  - Use range conditions for date filters (>= start_date AND < day_after_end_date).
+  - Apply ROUND(value, 0) for monetary amounts, ROUND(value, 2) for percentages.
+  - Default to ORDER BY date ASC for time-series queries.
+  - Omit LIMIT clause unless the user specifies a row count.
+
+  ## Aggregation Patterns (general — refer to column_hints for actual column names)
+  - **YTD/누계**: If the question implies cumulative aggregation (e.g. "누계", "YTD", "1월부터", "연초부터"), apply SUM over the cumulative date range, not a single period. The exact date column is given in column_hints.
+  - **Full period/전기간 (시계열)**: If the question asks for "전기간", "전체 기간" of an entity AND expects a time-series trend (e.g. "월별 추이", "기간별"), return one row per time bucket via GROUP BY on the time column.
+  - **프로젝트 전기간 합산**: 특정 프로젝트 코드(PJ/IT/WBS)로 필터된 조회에서 날짜 범위가 명시되지 않은 경우, 전기간을 합산한 단일 행으로 반환한다. tg_yyyymm을 GROUP BY에 포함하지 말 것. **단, '실적과 OL(Outlook)을 함께' 비교하거나 '월별 추이'를 요구하는 경우는 예외 — tg_yyyymm과 버전기준(ver_type_name)으로 월별×버전별 시계열을 출력한다(합산하지 말 것).** (단일 버전·단일 지표의 총액 조회는 기존대로 합산)
+  - **분기/반기/연간 집계**: "1분기", "2분기", "상반기", "하반기", "연간" 등 명시된 기간이 집계 단위인 경우, 해당 기간 전체를 하나로 합산한다. tg_yyyymm을 GROUP BY에 포함하면 기간이 월별로 분리되므로 GROUP BY에 포함하지 말 것.
+  - **Open-ended "~부터"**: 시작 시점만 명시하고 종료 시점이 없는 경우("X월부터 매월", "X년부터"), 종료 시점을 시작 연도 말로 제한하지 말 것. `tg_yyyymm >= 'start'`만 사용하거나, data_range의 최신 실적 월을 상한으로 사용. 예: "2022년 1월부터 매월" → `tg_yyyymm BETWEEN '202201' AND '202511'`.
+  - **Company-wide vs grouped**: If the question says "전사", "전체", "회사 전체" WITHOUT specifying a breakdown dimension, return a single aggregated row (no GROUP BY on organization). If the question says "~별" (e.g. "사업부별", "담당별"), return one row per group.
+  - **Snapshot vs flow columns**: Some metrics are stored as periodic snapshots (state at a point in time), others as flows (events within a period). For snapshot metrics, do not SUM across time buckets unless the user explicitly asks for the cumulative total. The column_hints description marks snapshot semantics where relevant.
+  - **Rate/Ratio output**: When the question asks only for a rate or ratio (비율, %, rate), always include the underlying base amounts in the SELECT output as well. Example: for '변동비율' request → SELECT raw 변동비 amount, 매출 amount, AND the computed ratio together.
+
+  ## Column Selection
+  - When `column_hints` contains multiple columns whose names or descriptions share the same surface keyword (e.g. several columns all containing "사업부" or "영업이익"), the bracketed guidance inside each column's description (e.g. "[~ 시 반드시 이 컬럼 사용]", "[~ 명시 시에만 사용]") overrides surface-level keyword matching. Pick the column whose bracketed guidance fits the question's intent.
+  - For free-text filter columns (account names, version names, organization free-form names, etc.), use the user's exact expression in the WHERE clause. Do NOT paraphrase, expand abbreviations, or substitute synonyms for filter values. If `reference_knowledge` provides a canonical mapping for an expression, use that canonical value; otherwise use the user's expression verbatim.
+  - Always include WHERE filter columns in SELECT. When a column is used as a filter condition (e.g. cp_type_name = '수정CP'), include that column in SELECT so the user can verify the correct data was retrieved.
+
+  ## Mandatory Filters
+  The following WHERE conditions MUST be applied unconditionally, regardless of what the user asks. Never omit them unless the user explicitly requests the excluded data.
+
+  - **SINARMAS exclusion** — For mgt_pl, award_result, emp tables: always add `corp_name != 'PT. LG SINARMAS TECHNOLOGY SOLUTIONS'`. Exception: user explicitly names SINARMAS.
+  - **UD org exclusion** — For mgt_pl, award_result, var_fix_pl tables: always add `ig_org3_cd <> 'U'`. Exception: user explicitly asks for UD / 서비스UD 조직.
+  - **emp mandatory conditions** — For prod_nbmifv_ai_emp_d_251218, always apply ALL three:
+    (1) `contr_type_name NOT IN ('외주직원', '파견')`
+    (2) `((corp_type_name IN ('본사', '자회사') AND fse_flag IN ('N', 'Y')) OR (corp_type_name = '해외법인' AND fse_flag = 'N'))`
+    (3) `gross_headcnt != 0`
+    Use `CAST(SUM(gross_headcnt) AS INTEGER)` for headcount aggregation.
+  - **pl_calc_type_name** — For mgt_pl: 사용자가 '연결기준' 또는 '별도기준'을 명시한 경우에만 `pl_calc_type_name = '연결'` 또는 `pl_calc_type_name = '별도'`를 WHERE에 추가. 명시하지 않은 경우 필터 불필요.
+  - **cp_summ standard analysis scope (확정CP/최종CP 재무 수치 — 'B2B Open 프로젝트')** — cp_summ에서 확정CP 또는 최종CP 레벨의 재무 수치(매출·영업이익·한계이익 등)를 집계할 때 다음 3종을 함께 적용한다: `object_type_name = '프로젝트'`, `b2b_b2c_cd != 'B2C'`, `open_family_sept_name = 'Open'`. 적용 제외 조건(아래 중 하나라도 해당 시 위 3종을 적용하지 않음):
+    (1) 수정CP 레벨/차수별 조회 (`cp_type_name = '수정CP'` 또는 차수별 분해 분석)
+    (2) 비재무 메타 조회 (CP 차수, 재경확정일자, Open/Family·B2B/B2C·프로젝트/내부과제 구분 등 — 재무 수치가 SELECT 대상이 아닌 경우)
+    (3) 단건 코드 조회 (`object_cd = '단일값'` 등치비교로 특정 프로젝트만 조회)
+    (4) 사용자가 '내부과제', 'Family', 'B2C', '전체 파이프라인' 등을 명시
+    (5) 분류 질문 (해당 컬럼이 SELECT 대상으로 사용자가 구분 자체를 묻는 경우)
+
+  ## Dimension Ambiguity
+  When a key analytical dimension is not explicitly specified by the user, do NOT silently pick one or aggregate across all categories. Include that dimension in SELECT and GROUP BY so each category appears as a separate row.
+
+  - **mgt_pl sales pipeline** (`sold_new_name`): If the user does not specify Sold / New / UD, include `sold_new_name` in SELECT and GROUP BY. Exception: when computing 확보율, the total pipeline is the explicit intent — do not split.
+  - **award_result version**: If the user does not specify 실적 or OL, query both latest 실적 and 당월OL via `bku_ver_top_name IN ('25년실적', '25년12월OL')` and include `bku_ver_top_name` in SELECT and GROUP BY so both appear as separate rows. Use values from `data_range`.
+  - **cp_summ CP type** (`cp_type_name`): If the user does not specify 제안CP / 확정CP / 수정CP, include `cp_type_name` in SELECT and GROUP BY. Merging all types into one aggregate produces meaningless numbers.
+  - For other dimensions, apply the same principle: expose ambiguous dimensions rather than choosing silently. Refer to `column_hints` for which columns apply per table.
+
+  ## JOIN Safety
+  - When using JOIN (including FULL OUTER JOIN, LEFT JOIN, RIGHT JOIN), always add IS NOT NULL conditions on the JOIN key columns in the WHERE clause (or ON clause). NULL keys never match each other in SQL equality, so rows with NULL keys from different sides create spurious unmatched buckets that inflate totals or rankings.
+
+  ## Comparison / Variance
+  - For "variance", "대비", "차이" style questions, compute each side as a separate aggregate (CTE or subquery) and output a single row containing the actual value, the comparison value, and the variance (actual − compare). Use NULLIF when computing ratios.
+  - For YoY / MoM growth, use (current − prior) / NULLIF(prior, 0) and ROUND to 2 decimals for percentage output.
+  - **다년/전년 대비 동기간 비교**: 여러 연도(예: "'24년 실적 대비", "전년 대비", "'25년 계획 대비")의 원가·매출 등을 비교할 때는 각 연도를 동일 기간으로 맞춘다 — 1월 ~ data_range의 '최신 실적 월'에 해당하는 월. 예) 최신 실적월 202511이면 24년은 tg_yyyymm 202401~202411, 25년은 202501~202511로 연도별 범위를 각각 1~동월로 건다. (연도 전체 1~12월로 걸면 미마감 월이 섞여 비교가 어긋남)
+
+  ## 최대/최소(순위) 질문
+  - "가장 높은/낮은/큰/작은 ~는 어디/무엇인가?" 류 질문은 RANK() OVER (ORDER BY 지표 DESC 또는 ASC)로 순위를 매겨 1위를 반환한다.
+  - 최댓값/최솟값이 동일한 항목이 여럿이면(공동 순위) 모두 표시한다. LIMIT 1로 임의의 1개만 잘라내지 말 것 — 공동 1위가 누락된다.
+  - 유일한 최대/최소면 RANK로도 1개만 반환되므로 동일하게 처리하면 된다.
+
+unanswerable_rules: |
+  Do not generate SQL in the following cases. Instead, return only the reason.
+  - The question requires columns or data that do not exist in the provided table.
+  - The question asks for operations other than SELECT.
+  - The question is too ambiguous to determine which formula or condition to apply.
+
+  Output format when unanswerable:
+  [UNANSWERABLE] Reason: {specific reason}
+
+# 운영 시점에 따라 변경되는 정보. 분기/월 갱신 시 이 파일을 직접 수정하세요.
+data_range: |
+  - 데이터 기준일: 2025년 12월 18일
+  - 주의: 위 Current Date(실제 운영 날짜)와 무관하게, 버전명·당월 추론은 반드시 이 데이터 기준일 기준으로 수행할 것
+  - 당월 OL: bku_ver_top_name = '25년12월OL' (ver_type_name = 'Outlook')
+  - 최신 실적 버전: bku_ver_top_name = '25년실적' (ver_type_name = '실적')
+  - 최신 실적 월: 202511 (12월 실적 데이터는 불완전할 수 있으므로 주의)
+  - 다년도 조회 시 버전 선택: 결산이 완료된 과거 연도는 해당 연도의 'YY년실적' 버전 사용. 현재 진행 중인 연도(결산 미완료)는 사용자가 '실적'을 명시하지 않으면 위 '당월 OL' 버전(ver_type_name = 'Outlook') 사용.
+
+current_plan: |
+  - (운영 시점에 맞춰 갱신)
